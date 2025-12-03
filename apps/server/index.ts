@@ -1505,13 +1505,19 @@ async function serveGameClient(gameName: string, roomName: string | undefined, r
       // Get player metadata from state
       const playerMetadata = state.playerMetadata || {};
 
-      // Try to get socket IDs from different possible state structures
+      // Try to get socket IDs from different possible state structures.
+      // Many templates store players in state.players or state.playerColors,
+      // but some generated games might not. In those cases, fall back to the
+      // keys of playerMetadata, which is always derived from the server's
+      // authoritative room.players map.
       let socketIds = [];
 
       if (state.players && typeof state.players === 'object') {
         socketIds = Object.keys(state.players);
       } else if (state.playerColors && typeof state.playerColors === 'object') {
         socketIds = Object.keys(state.playerColors);
+      } else if (playerMetadata && typeof playerMetadata === 'object') {
+        socketIds = Object.keys(playerMetadata);
       }
 
       currentPlayerCount = socketIds.length;
