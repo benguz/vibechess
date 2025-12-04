@@ -7,10 +7,14 @@ import type { Game, GameStats } from "./lib/types.js";
 import { PREMADE_GAMES } from "./lib/premade-games.js";
 import vm from "vm";
 import path from "path";
-import { fileURLToPath } from 'url';
-import { Chess } from 'chess.js';
-import { DEFAULT_ELO, calculate1v1EloChange, calculateMultiplayerEloChanges } from './lib/elo.js';
-import eloRouter from './routes/elo.js';
+import { fileURLToPath } from "url";
+import { Chess } from "chess.js";
+import {
+  DEFAULT_ELO,
+  calculate1v1EloChange,
+  calculateMultiplayerEloChanges,
+} from "./lib/elo.js";
+import eloRouter from "./routes/elo.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -18,79 +22,86 @@ const __dirname = path.dirname(__filename);
 const app = express();
 
 // Configure allowed origins for CORS and iframe embedding
-const isDevelopment = process.env.NODE_ENV === 'development';
+const isDevelopment = process.env.NODE_ENV === "development";
 
 // Allow custom origins from environment variable (comma-separated)
 // Example: ALLOWED_ORIGINS=https://example.com,https://another.com
-const customOrigins = process.env.ALLOWED_ORIGINS 
-  ? process.env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim())
+const customOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(",").map((origin) => origin.trim())
   : [];
 
-const defaultOrigins = isDevelopment 
+const defaultOrigins = isDevelopment
   ? [
-      'http://localhost:3000',
-      'http://127.0.0.1:3000',
-      'http://localhost:3001',
-      'http://127.0.0.1:3001'
+      "http://localhost:3000",
+      "http://127.0.0.1:3000",
+      "http://localhost:3001",
+      "http://127.0.0.1:3001",
     ]
-  : [
-      'https://splork.io',
-      'https://www.splork.io',
-      'https://play.splork.io'
-    ];
+  : ["https://splork.io", "https://www.splork.io", "https://play.splork.io"];
 
 const allowedOrigins = [...defaultOrigins, ...customOrigins];
 
-console.log('🔒 Allowed origins for CORS and iframe embedding:', allowedOrigins);
+console.log(
+  "🔒 Allowed origins for CORS and iframe embedding:",
+  allowedOrigins,
+);
 
 // CORS configuration
-app.use(cors({
-  origin: (origin, callback) => {
-    // Allow requests with no origin (like mobile apps, curl, postman)
-    if (!origin) return callback(null, true);
-    
-    if (allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      console.warn(`CORS blocked origin: ${origin}`);
-      callback(null, true); // Still allow for now, but log it
-    }
-  },
-  credentials: true,
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
-}));
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Allow requests with no origin (like mobile apps, curl, postman)
+      if (!origin) return callback(null, true);
+
+      if (allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        console.warn(`CORS blocked origin: ${origin}`);
+        callback(null, true); // Still allow for now, but log it
+      }
+    },
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  }),
+);
 
 // Headers for iframe embedding
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  
+
   // Set Content-Security-Policy to allow iframe embedding from allowed origins
   if (origin && allowedOrigins.includes(origin)) {
-    res.setHeader('Content-Security-Policy', `frame-ancestors ${allowedOrigins.join(' ')}`);
+    res.setHeader(
+      "Content-Security-Policy",
+      `frame-ancestors ${allowedOrigins.join(" ")}`,
+    );
   } else {
     // Allow all origins for iframe embedding in development, or if origin not specified
-    res.setHeader('Content-Security-Policy', `frame-ancestors ${allowedOrigins.join(' ')}`);
+    res.setHeader(
+      "Content-Security-Policy",
+      `frame-ancestors ${allowedOrigins.join(" ")}`,
+    );
   }
-  
+
   // Don't set X-Frame-Options since we're using CSP frame-ancestors
   // (X-Frame-Options would conflict with CSP)
-  
+
   next();
 });
 
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, "public")));
 
 // Mount ELO API routes
-app.use('/api/elo', eloRouter);
+app.use("/api/elo", eloRouter);
 
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: {
     origin: allowedOrigins,
     methods: ["GET", "POST"],
-    credentials: true
-  }
+    credentials: true,
+  },
 });
 
 const PORT = process.env.PORT || 3001;
@@ -124,7 +135,7 @@ interface MatchmakingPlayer {
 }
 
 interface MatchmakingResult {
-  status: 'waiting' | 'matched';
+  status: "waiting" | "matched";
   roomId?: string;
 }
 
@@ -141,70 +152,130 @@ interface MatchmakingRoom {
 }
 const matchmakingRooms = new Map<string, MatchmakingRoom>();
 
-// Function to try to match players
+// Grace period before matching with fewer than maxPlayers (in milliseconds)
+const MATCHMAKING_GRACE_PERIOD_MS = 5000;
+
+// Per-game mutex to prevent concurrent matching for the same game
+const gameMatchingInProgress = new Map<string, boolean>();
+const gameMatchingPending = new Map<string, boolean>();
+
+// Function to try to match players for all games
 async function tryMatchPlayers() {
-  // Group players by game
-  const playersByGame = new Map<string, MatchmakingPlayer[]>();
-  
-  matchmakingQueue.forEach(player => {
-    const players = playersByGame.get(player.gameName) || [];
-    players.push(player);
-    playersByGame.set(player.gameName, players);
-  });
-  
-  // Try to match players for each game, respecting min/max players per room
-  for (const [gameName, players] of playersByGame.entries()) {
-    // Oldest first
-    players.sort((a, b) => a.timestamp - b.timestamp);
+  // Get unique game names from the queue
+  const gameNames = new Set<string>();
+  matchmakingQueue.forEach((player) => gameNames.add(player.gameName));
 
-    const { minPlayers, maxPlayers } = await getRoomConfigForGame(gameName);
+  // Process each game in parallel (each with its own mutex)
+  await Promise.all(
+    Array.from(gameNames).map((gameName) => tryMatchPlayersForGame(gameName)),
+  );
+}
 
-    while (players.length >= minPlayers) {
-      const groupSize = Math.min(maxPlayers, players.length);
-      const group: MatchmakingPlayer[] = players.splice(0, groupSize);
+// Match players for a specific game (with per-game mutex)
+async function tryMatchPlayersForGame(gameName: string) {
+  // If matching is already in progress for this game, mark pending and return
+  if (gameMatchingInProgress.get(gameName)) {
+    gameMatchingPending.set(gameName, true);
+    return;
+  }
 
-      if (group.length < minPlayers) {
-        // Not enough players left to form a valid room
-        break;
-      }
+  gameMatchingInProgress.set(gameName, true);
 
-      // Generate a unique room ID for the match
-      const roomId = `match-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+  try {
+    await doMatchPlayersForGame(gameName);
+  } finally {
+    gameMatchingInProgress.set(gameName, false);
 
-      const expectedPlayers = new Set<string>();
-      for (const player of group) {
-        expectedPlayers.add(player.playerId);
-      }
-
-      // Register the matchmaking room
-      matchmakingRooms.set(roomId, {
-        roomId,
-        gameName,
-        expectedPlayers,
-        connectedPlayers: new Set(),
-        createdAt: Date.now()
-      });
-
-      // Set match results and remove from global queue
-      for (const player of group) {
-        matchmakingResults.set(player.playerId, {
-          status: 'matched',
-          roomId
-        });
-
-        const index = matchmakingQueue.findIndex(p => p.playerId === player.playerId);
-        if (index !== -1) {
-          matchmakingQueue.splice(index, 1);
-        }
-      }
-
-      console.log(
-        `Matched ${group.length} player(s) for game ${gameName} in room ${roomId}:`,
-        group.map(p => p.playerId).join(", ")
-      );
+    // If another call came in while we were running, run again
+    if (gameMatchingPending.get(gameName)) {
+      gameMatchingPending.set(gameName, false);
+      setImmediate(() => tryMatchPlayersForGame(gameName));
     }
   }
 }
+
+// Internal matching logic for a specific game (called only when per-game mutex is held)
+async function doMatchPlayersForGame(gameName: string) {
+  // Get players for this game from the queue
+  const players = matchmakingQueue.filter((p) => p.gameName === gameName);
+
+  if (players.length === 0) return;
+
+  // Oldest first
+  players.sort((a, b) => a.timestamp - b.timestamp);
+
+  const { minPlayers, maxPlayers } = await getRoomConfigForGame(gameName);
+
+  while (players.length >= minPlayers) {
+    const groupSize = Math.min(maxPlayers, players.length);
+
+    // If we have fewer than maxPlayers, check if we should wait for more
+    if (groupSize < maxPlayers && minPlayers < maxPlayers) {
+      const oldestPlayer = players[0];
+      if (!oldestPlayer) break; // Safety check (shouldn't happen given while condition)
+      const waitTime = Date.now() - oldestPlayer.timestamp;
+
+      // Wait for the grace period before matching with fewer than max players
+      if (waitTime < MATCHMAKING_GRACE_PERIOD_MS) {
+        console.log(
+          `Waiting for more players for ${gameName}: ${players.length}/${maxPlayers} players, oldest waited ${Math.round(waitTime / 1000)}s/${MATCHMAKING_GRACE_PERIOD_MS / 1000}s`,
+        );
+        break; // Don't match yet, wait for more players or grace period to expire
+      }
+    }
+
+    const group: MatchmakingPlayer[] = players.splice(0, groupSize);
+
+    if (group.length < minPlayers) {
+      // Not enough players left to form a valid room
+      break;
+    }
+
+    // Generate a unique room ID for the match
+    const roomId = `match-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+
+    const expectedPlayers = new Set<string>();
+    for (const player of group) {
+      expectedPlayers.add(player.playerId);
+    }
+
+    // Register the matchmaking room
+    matchmakingRooms.set(roomId, {
+      roomId,
+      gameName,
+      expectedPlayers,
+      connectedPlayers: new Set(),
+      createdAt: Date.now(),
+    });
+
+    // Set match results and remove from global queue
+    for (const player of group) {
+      matchmakingResults.set(player.playerId, {
+        status: "matched",
+        roomId,
+      });
+
+      const index = matchmakingQueue.findIndex(
+        (p) => p.playerId === player.playerId,
+      );
+      if (index !== -1) {
+        matchmakingQueue.splice(index, 1);
+      }
+    }
+
+    console.log(
+      `Matched ${group.length} player(s) for game ${gameName} in room ${roomId}:`,
+      group.map((p) => p.playerId).join(", "),
+    );
+  }
+}
+
+// Periodically try to match players (handles grace period expiration)
+setInterval(() => {
+  if (matchmakingQueue.length > 0) {
+    tryMatchPlayers();
+  }
+}, 1000);
 
 // Periodically clean up stale matchmaking data
 setInterval(() => {
@@ -214,8 +285,8 @@ setInterval(() => {
 
   // Clean up old matchmaking results
   matchmakingResults.forEach((result, playerId) => {
-    const player = matchmakingQueue.find(p => p.playerId === playerId);
-    if (!player && result.status === 'matched') {
+    const player = matchmakingQueue.find((p) => p.playerId === playerId);
+    if (!player && result.status === "matched") {
       matchmakingResults.delete(playerId);
     }
   });
@@ -225,32 +296,41 @@ setInterval(() => {
   matchmakingQueue.forEach((player, index) => {
     const age = now - player.timestamp;
     if (age > ONE_HOUR) {
-      console.log(`Removing stale player ${player.playerId} from queue (age: ${Math.round(age / 1000)}s)`);
+      console.log(
+        `Removing stale player ${player.playerId} from queue (age: ${Math.round(age / 1000)}s)`,
+      );
       staleIndices.push(index);
       matchmakingResults.delete(player.playerId);
     }
   });
   // Remove in reverse order to maintain indices
-  staleIndices.reverse().forEach(index => matchmakingQueue.splice(index, 1));
+  staleIndices.reverse().forEach((index) => matchmakingQueue.splice(index, 1));
 
   // Clean up matchmaking rooms where players never connected (> 1 minute old)
   matchmakingRooms.forEach((room, roomId) => {
     const age = now - room.createdAt;
-    const allPlayersConnected = room.connectedPlayers.size === room.expectedPlayers.size;
+    const allPlayersConnected =
+      room.connectedPlayers.size === room.expectedPlayers.size;
 
     if (!allPlayersConnected && age > ONE_MINUTE) {
-      console.log(`Cleaning up stale matchmaking room ${roomId} (age: ${Math.round(age / 1000)}s, ${room.connectedPlayers.size}/${room.expectedPlayers.size} players connected)`);
+      console.log(
+        `Cleaning up stale matchmaking room ${roomId} (age: ${Math.round(age / 1000)}s, ${room.connectedPlayers.size}/${room.expectedPlayers.size} players connected)`,
+      );
 
       // Put any players who didn't connect back in the queue
-      room.expectedPlayers.forEach(playerId => {
-        if (!Array.from(room.connectedPlayers).some(socketId => {
-          // Check if this socketId belongs to this playerId
-          // This is a bit tricky since we don't have a direct mapping here
-          return false; // Just remove the match result and let them re-queue
-        })) {
+      room.expectedPlayers.forEach((playerId) => {
+        if (
+          !Array.from(room.connectedPlayers).some((socketId) => {
+            // Check if this socketId belongs to this playerId
+            // This is a bit tricky since we don't have a direct mapping here
+            return false; // Just remove the match result and let them re-queue
+          })
+        ) {
           // Remove their match result so they can queue again
           matchmakingResults.delete(playerId);
-          console.log(`Cleared match result for disconnected player ${playerId}`);
+          console.log(
+            `Cleared match result for disconnected player ${playerId}`,
+          );
         }
       });
 
@@ -265,11 +345,11 @@ const TICK_RATE = 16; // ~60 FPS
 // Helper function to filter out server-only state fields (prefixed with _)
 function getClientState(state: any): any {
   if (Array.isArray(state)) {
-    return state.map(item => getClientState(item));
-  } else if (state && typeof state === 'object') {
+    return state.map((item) => getClientState(item));
+  } else if (state && typeof state === "object") {
     const filtered: any = {};
     for (const key in state) {
-      if (!key.startsWith('_')) {
+      if (!key.startsWith("_")) {
         filtered[key] = getClientState(state[key]);
       }
     }
@@ -283,11 +363,14 @@ function enrichStateWithPlayerMetadata(state: any, room: Room): any {
   const clientState = getClientState(state);
 
   // Build player metadata map (socket ID -> persistent ID + username)
-  const playerMetadata: Record<string, { persistentId: string; username: string }> = {};
+  const playerMetadata: Record<
+    string,
+    { persistentId: string; username: string }
+  > = {};
   for (const [socketId, player] of room.players.entries()) {
     playerMetadata[socketId] = {
       persistentId: player.persistentId || socketId,
-      username: player.username || 'Guest'
+      username: player.username || "Guest",
     };
   }
 
@@ -298,9 +381,12 @@ function enrichStateWithPlayerMetadata(state: any, room: Room): any {
 }
 
 // Helper to get or create player ELO for a game
-async function getPlayerElo(playerId: string, gameName: string): Promise<number> {
+async function getPlayerElo(
+  playerId: string,
+  gameName: string,
+): Promise<number> {
   try {
-    const { rows } = await query<{elo_rating: number}>`
+    const { rows } = await query<{ elo_rating: number }>`
       SELECT elo_rating FROM player_elo
       WHERE player_id = ${playerId} AND game_name = ${gameName}
     `;
@@ -338,7 +424,7 @@ async function handleGameEnd(room: Room): Promise<void> {
     for (const socketId of socketIds) {
       const player = room.players.get(socketId);
       const persistentId = player?.persistentId || socketId; // Fallback to socket ID if no persistent ID
-      const username: string = player?.username || 'Guest';
+      const username: string = player?.username || "Guest";
       socketToPersistentId[socketId] = persistentId;
       persistentIdToUsername[persistentId] = username;
       persistentIds.push(persistentId);
@@ -347,14 +433,19 @@ async function handleGameEnd(room: Room): Promise<void> {
     // Get current ELO ratings for all players (using persistent IDs)
     const playerRatings: Record<string, number> = {};
     for (const persistentId of persistentIds) {
-      playerRatings[persistentId] = await getPlayerElo(persistentId, room.gameName);
+      playerRatings[persistentId] = await getPlayerElo(
+        persistentId,
+        room.gameName,
+      );
     }
 
     // Calculate ELO changes
     let eloChanges: Record<string, { newElo: number; change: number }>;
 
     // Convert gameWinner from socket ID to persistent ID
-    const winnerPersistentId: string | null = state.gameWinner ? (socketToPersistentId[state.gameWinner] || null) : null;
+    const winnerPersistentId: string | null = state.gameWinner
+      ? socketToPersistentId[state.gameWinner] || null
+      : null;
 
     if (persistentIds.length === 2) {
       // 1v1 game
@@ -374,29 +465,34 @@ async function handleGameEnd(room: Room): Promise<void> {
         return;
       }
 
-      let result: 'player1' | 'player2' | 'draw';
+      let result: "player1" | "player2" | "draw";
 
       if (winnerPersistentId === player1) {
-        result = 'player1';
+        result = "player1";
       } else if (winnerPersistentId === player2) {
-        result = 'player2';
+        result = "player2";
       } else {
-        result = 'draw';
+        result = "draw";
       }
 
-      const changes = calculate1v1EloChange(
-        player1Elo,
-        player2Elo,
-        result
-      );
+      const changes = calculate1v1EloChange(player1Elo, player2Elo, result);
 
       eloChanges = {
-        [player1]: { newElo: changes.player1NewElo, change: changes.player1Change },
-        [player2]: { newElo: changes.player2NewElo, change: changes.player2Change }
+        [player1]: {
+          newElo: changes.player1NewElo,
+          change: changes.player1Change,
+        },
+        [player2]: {
+          newElo: changes.player2NewElo,
+          change: changes.player2Change,
+        },
       };
     } else {
       // Multiplayer game (3+ players)
-      eloChanges = calculateMultiplayerEloChanges(playerRatings, winnerPersistentId);
+      eloChanges = calculateMultiplayerEloChanges(
+        playerRatings,
+        winnerPersistentId,
+      );
     }
 
     // Update database for each player (using persistent IDs)
@@ -411,7 +507,7 @@ async function handleGameEnd(room: Room): Promise<void> {
       const isWinner = winnerPersistentId === persistentId;
       const isDraw = state.gameWinner === null;
 
-      const username = persistentIdToUsername[persistentId] || 'Guest';
+      const username = persistentIdToUsername[persistentId] || "Guest";
 
       await query`
         INSERT INTO player_elo (player_id, game_name, elo_rating, games_played, wins, losses, draws, username)
@@ -451,9 +547,8 @@ async function handleGameEnd(room: Room): Promise<void> {
     `;
 
     console.log(`✓ ELO updated for room ${room.id} (${room.gameName})`);
-    console.log('  Winner (persistent ID):', winnerPersistentId);
-    console.log('  Changes:', eloChanges);
-
+    console.log("  Winner (persistent ID):", winnerPersistentId);
+    console.log("  Changes:", eloChanges);
   } catch (e) {
     console.error(`Error handling game end for room ${room.id}:`, e);
   }
@@ -482,7 +577,10 @@ function startGameLoop(room: Room) {
       }
 
       // Broadcast updated state to all players in the room (filter out _ prefixed fields)
-      io.to(room.id).emit("state_update", enrichStateWithPlayerMetadata(room.state, room));
+      io.to(room.id).emit(
+        "state_update",
+        enrichStateWithPlayerMetadata(room.state, room),
+      );
     } catch (e) {
       console.error(`Error in tick for room ${room.id}:`, e);
     }
@@ -501,11 +599,15 @@ function stopGameLoop(room: Room) {
 }
 
 // Helper function to serve game client
-async function serveGameClient(gameName: string, roomName: string | undefined, res: any, hideUI: boolean = false) {
-  
+async function serveGameClient(
+  gameName: string,
+  roomName: string | undefined,
+  res: any,
+  hideUI: boolean = false,
+) {
   try {
     let game: Game | null = null;
-    
+
     // Check if it's a premade game
     if (PREMADE_GAMES[gameName as keyof typeof PREMADE_GAMES]) {
       const premade = PREMADE_GAMES[gameName as keyof typeof PREMADE_GAMES];
@@ -514,48 +616,58 @@ async function serveGameClient(gameName: string, roomName: string | undefined, r
         name: premade.name,
         description: premade.description,
         code: premade.code,
-        created_at: new Date()
+        created_at: new Date(),
       };
     } else {
       // Fetch from database
       const tableName = getGamesTableName();
       const { rows } = await query<Game>(
         `SELECT * FROM ${tableName} WHERE name = $1`,
-        gameName
+        gameName,
       );
       if (rows.length === 0) {
-        return res.status(404).send('Game not found');
+        return res.status(404).send("Game not found");
       }
       // rows[0] could be undefined, convert to null if needed
       game = rows[0] ?? null;
     }
-    
+
     // At this point, game should never be null (we return early if not found)
     // But TypeScript doesn't track the early return, so we add a safety check
     if (!game) {
-      return res.status(404).send('Game not found');
+      return res.status(404).send("Game not found");
     }
-    
-    const prefilledRoom = roomName || '';
-    const escapedPrefilledRoom = prefilledRoom.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
+    const prefilledRoom = roomName || "";
+    const escapedPrefilledRoom = prefilledRoom
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
 
     const rawGame: any = game;
     const minPlayersPerRoom =
-      typeof rawGame.min_players_per_room === 'number' && Number.isFinite(rawGame.min_players_per_room)
+      typeof rawGame.min_players_per_room === "number" &&
+      Number.isFinite(rawGame.min_players_per_room)
         ? Math.max(1, Math.floor(rawGame.min_players_per_room))
         : 2;
     const maxPlayersPerRoom =
-      typeof rawGame.max_players_per_room === 'number' && Number.isFinite(rawGame.max_players_per_room)
+      typeof rawGame.max_players_per_room === "number" &&
+      Number.isFinite(rawGame.max_players_per_room)
         ? Math.max(minPlayersPerRoom, Math.floor(rawGame.max_players_per_room))
         : 2;
     const hasWinCondition =
-      typeof rawGame.has_win_condition === 'boolean' ? rawGame.has_win_condition : true;
+      typeof rawGame.has_win_condition === "boolean"
+        ? rawGame.has_win_condition
+        : true;
     const canJoinLate =
-      typeof rawGame.can_join_late === 'boolean' ? rawGame.can_join_late : false;
-    
+      typeof rawGame.can_join_late === "boolean"
+        ? rawGame.can_join_late
+        : false;
+
     // Determine the home URL based on environment
-    const homeUrl = isDevelopment ? 'http://localhost:3000' : 'https://splork.io';
-    
+    const homeUrl = isDevelopment
+      ? "http://localhost:3000"
+      : "https://splork.io";
+
     // Serve HTML page that loads the game
     res.send(`
 <!DOCTYPE html>
@@ -694,6 +806,36 @@ async function serveGameClient(gameName: string, roomName: string | undefined, r
       background: rgba(102, 126, 234, 0.9);
       border-color: #667eea;
       transform: scale(1.1);
+    }
+    #bottom-right-share-btn {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      background: rgba(0, 0, 0, 0.9);
+      border: 1px solid #444;
+      border-radius: 9999px;
+      padding: 10px 18px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      cursor: pointer;
+      z-index: 999;
+      color: #fff;
+      font-size: 14px;
+      font-weight: 600;
+      transition: all 0.2s ease;
+      opacity: 0;
+      pointer-events: none;
+    }
+    #bottom-right-share-btn.visible {
+      opacity: 1;
+      pointer-events: auto;
+    }
+    #bottom-right-share-btn:hover {
+      background: rgba(102, 126, 234, 0.9);
+      border-color: #667eea;
+      transform: translateY(-1px);
     }
     #game-chat {
       position: fixed;
@@ -1034,19 +1176,19 @@ async function serveGameClient(gameName: string, roomName: string | undefined, r
   </style>
 </head>
 <body>
-  <div id="room-setup"${prefilledRoom ? ' class="hidden"' : ''}>
+  <div id="room-setup"${prefilledRoom ? ' class="hidden"' : ""}>
     <h1>${game.name}</h1>
-    <p style="color: #888; margin: 10px 0;">${game.description || 'Multiplayer Game'}</p>
+    <p style="color: #888; margin: 10px 0;">${game.description || "Multiplayer Game"}</p>
     <input type="text" id="room-name" placeholder="Enter room name" value="${escapedPrefilledRoom}" />
     <button id="join-btn">Join Game</button>
     <div id="error-msg"></div>
   </div>
 
-  <div id="game-container" class="${prefilledRoom ? '' : 'hidden'}">
+  <div id="game-container" class="${prefilledRoom ? "" : "hidden"}">
     <div id="game-canvas"></div>
 
     <!-- Back button -->
-    <a id="back-button" href="${homeUrl}" target="_top" style="${hideUI ? 'display: none;' : ''}">
+    <a id="back-button" href="${homeUrl}" target="_top" style="${hideUI ? "display: none;" : ""}">
       <span>←</span>
       <span>Back to Home</span>
     </a>
@@ -1055,18 +1197,18 @@ async function serveGameClient(gameName: string, roomName: string | undefined, r
     <div id="players-display" style="display: none;"></div>
 
     <!-- Toggle button for mobile -->
-    <button id="game-ui-toggle" style="${hideUI ? 'display: none;' : ''}" title="Toggle Game Info">
+    <button id="game-ui-toggle" style="${hideUI ? "display: none;" : ""}" title="Toggle Game Info">
       ℹ️
     </button>
 
-    <div id="game-ui" style="${hideUI ? 'display: none;' : ''}">
+    <div id="game-ui" style="${hideUI ? "display: none;" : ""}">
       <div id="game-ui-header">
         <span id="game-ui-title">ℹ️ Game Info</span>
         <span id="game-ui-collapse-toggle">▼</span>
       </div>
       <div class="info-row">
         <span class="info-label">Room:</span>
-        <span class="info-value" id="current-room">${prefilledRoom || '-'}</span>
+        <span class="info-value" id="current-room">${prefilledRoom || "-"}</span>
       </div>
       <div class="info-row">
         <span class="info-label">Players:</span>
@@ -1094,12 +1236,21 @@ async function serveGameClient(gameName: string, roomName: string | undefined, r
   </div>
 
   <!-- Chat toggle button -->
-  <button id="chat-toggle-btn" style="${hideUI ? 'display: none;' : ''}" title="Toggle Chat">
+  <button id="chat-toggle-btn" style="${hideUI ? "display: none;" : ""}" title="Toggle Chat">
     💬
   </button>
 
+  <!-- Bottom-right share link button (only visible when Game Info is collapsed) -->
+  <button
+    id="bottom-right-share-btn"
+    style="${hideUI ? "display: none;" : ""}"
+    title="Copy Share Link"
+  >
+    📋 Copy Share Link
+  </button>
+
   <!-- Game Chat -->
-  <div id="game-chat" style="${hideUI ? 'display: none;' : ''}">
+  <div id="game-chat" style="${hideUI ? "display: none;" : ""}">
     <div id="chat-header">
       <span id="chat-title">💬 Room Chat</span>
       <span id="chat-toggle">▼</span>
@@ -1117,7 +1268,7 @@ async function serveGameClient(gameName: string, roomName: string | undefined, r
       <div id="game-over-details"></div>
       <div style="margin-top: 20px;">
         <button id="play-again-btn"}>🎯 Enter Matchmaking Again</button>
-        <a id="back-to-home-btn" href="${homeUrl}/play/${gameName}" style="${hideUI ? 'display: none;' : ''}" target="_top">← Back to Game Selection</a>
+        <a id="back-to-home-btn" href="${homeUrl}/play/${gameName}" style="${hideUI ? "display: none;" : ""}" target="_top">← Back to Game Selection</a>
       </div>
     </div>
   </div>
@@ -1147,15 +1298,15 @@ async function serveGameClient(gameName: string, roomName: string | undefined, r
   <script src="/socket.io/socket.io.js"></script>
   <script>
     const gameName = "${gameName}";
-    const isHideUI = ${hideUI ? 'true' : 'false'};
+    const isHideUI = ${hideUI ? "true" : "false"};
     let socket;
     let currentRoom;
     let gameInstance;
     let isConnected = false;
   const minPlayersPerRoom = ${minPlayersPerRoom};
   const maxPlayersPerRoom = ${maxPlayersPerRoom};
-  const hasWinCondition = ${hasWinCondition ? 'true' : 'false'};
-  const canJoinLate = ${canJoinLate ? 'true' : 'false'};
+  const hasWinCondition = ${hasWinCondition ? "true" : "false"};
+  const canJoinLate = ${canJoinLate ? "true" : "false"};
   let currentPlayerCount = 0;
     
     // Get player ID and username from URL parameters (set by web app) or fallback to localStorage
@@ -1205,14 +1356,21 @@ async function serveGameClient(gameName: string, roomName: string | undefined, r
     const gameUI = document.getElementById('game-ui');
     const gameUIHeader = document.getElementById('game-ui-header');
     const gameUICollapseToggle = document.getElementById('game-ui-collapse-toggle');
+    const bottomRightShareBtn = document.getElementById('bottom-right-share-btn');
     let gameUICollapsed = true;
 
     // Function to update toggle button visibility
     function updateToggleVisibility() {
       if (gameUICollapsed) {
         gameUIToggle.classList.add('visible');
+        if (bottomRightShareBtn) {
+          bottomRightShareBtn.classList.add('visible');
+        }
       } else {
         gameUIToggle.classList.remove('visible');
+        if (bottomRightShareBtn) {
+          bottomRightShareBtn.classList.remove('visible');
+        }
       }
     }
 
@@ -1285,6 +1443,11 @@ async function serveGameClient(gameName: string, roomName: string | undefined, r
     const waitingShareBtn = document.getElementById('waiting-share-btn');
     if (waitingShareBtn) {
       waitingShareBtn.addEventListener('click', () => copyShareLink(waitingShareBtn));
+    }
+
+    // Bottom-right share button (visible when Game Info is collapsed)
+    if (bottomRightShareBtn) {
+      bottomRightShareBtn.addEventListener('click', () => copyShareLink(bottomRightShareBtn));
     }
 
     // Setup chat functionality
@@ -1736,38 +1899,41 @@ async function serveGameClient(gameName: string, roomName: string | undefined, r
 </html>
     `);
   } catch (err) {
-    console.error('Error loading game:', err);
-    res.status(500).send('Error loading game');
+    console.error("Error loading game:", err);
+    res.status(500).send("Error loading game");
   }
 }
 
 // Route handlers for game client
 // With room name in URL
-app.get('/game/:gameName/:roomName', async (req, res) => {
+app.get("/game/:gameName/:roomName", async (req, res) => {
   const { gameName, roomName } = req.params;
-  const hideUI = req.query.hideUI === 'true';
+  const hideUI = req.query.hideUI === "true";
   await serveGameClient(gameName, roomName, res, hideUI);
 });
 
 // Without room name in URL
-app.get('/game/:gameName', async (req, res) => {
+app.get("/game/:gameName", async (req, res) => {
   const { gameName } = req.params;
-  const hideUI = req.query.hideUI === 'true';
+  const hideUI = req.query.hideUI === "true";
   await serveGameClient(gameName, undefined, res, hideUI);
 });
 
 // Helper function to get active player count for a game
-function getGameStats(gameName: string): { activePlayers: number; activeRooms: number } {
+function getGameStats(gameName: string): {
+  activePlayers: number;
+  activeRooms: number;
+} {
   let activePlayers = 0;
   let activeRooms = 0;
-  
+
   rooms.forEach((room) => {
     if (room.gameName === gameName) {
       activePlayers += room.players.size;
       activeRooms += 1;
     }
   });
-  
+
   return { activePlayers, activeRooms };
 }
 
@@ -1778,11 +1944,11 @@ async function incrementPlayCount(gameName: string): Promise<void> {
     if (PREMADE_GAMES[gameName as keyof typeof PREMADE_GAMES]) {
       return;
     }
-    
+
     const tableName = getGamesTableName();
     await query(
       `UPDATE ${tableName} SET play_count = COALESCE(play_count, 0) + 1, last_played_at = NOW() WHERE name = $1`,
-      gameName
+      gameName,
     );
     console.log(`Incremented play count for game: ${gameName}`);
   } catch (err) {
@@ -1803,7 +1969,7 @@ async function getRoomConfigForGame(gameName: string): Promise<{
       minPlayers: 2,
       maxPlayers: 2,
       hasWinCondition: true,
-      canJoinLate: false
+      canJoinLate: false,
     };
   }
 
@@ -1811,29 +1977,31 @@ async function getRoomConfigForGame(gameName: string): Promise<{
     const tableName = getGamesTableName();
     const { rows } = await query<Game>(
       `SELECT min_players_per_room, max_players_per_room, has_win_condition, can_join_late FROM ${tableName} WHERE name = $1`,
-      gameName
+      gameName,
     );
 
     const raw: any = rows[0] ?? {};
 
     const minPlayers =
-      typeof raw.min_players_per_room === 'number' && Number.isFinite(raw.min_players_per_room)
+      typeof raw.min_players_per_room === "number" &&
+      Number.isFinite(raw.min_players_per_room)
         ? Math.max(1, Math.floor(raw.min_players_per_room))
         : 2;
     const maxPlayers =
-      typeof raw.max_players_per_room === 'number' && Number.isFinite(raw.max_players_per_room)
+      typeof raw.max_players_per_room === "number" &&
+      Number.isFinite(raw.max_players_per_room)
         ? Math.max(minPlayers, Math.floor(raw.max_players_per_room))
         : 2;
     const hasWinCondition =
-      typeof raw.has_win_condition === 'boolean' ? raw.has_win_condition : true;
+      typeof raw.has_win_condition === "boolean" ? raw.has_win_condition : true;
     const canJoinLate =
-      typeof raw.can_join_late === 'boolean' ? raw.can_join_late : false;
+      typeof raw.can_join_late === "boolean" ? raw.can_join_late : false;
 
     return {
       minPlayers,
       maxPlayers,
       hasWinCondition,
-      canJoinLate
+      canJoinLate,
     };
   } catch (e) {
     console.error(`Error fetching room config for game ${gameName}:`, e);
@@ -1841,42 +2009,42 @@ async function getRoomConfigForGame(gameName: string): Promise<{
       minPlayers: 2,
       maxPlayers: 2,
       hasWinCondition: true,
-      canJoinLate: false
+      canJoinLate: false,
     };
   }
 }
 
 // API endpoint to list all games
-app.get('/api/games', async (req, res) => {
+app.get("/api/games", async (req, res) => {
   try {
     const tableName = getGamesTableName();
     const { rows } = await query<Game>(
-      `SELECT id, name, description, created_at, play_count, last_played_at FROM ${tableName} ORDER BY created_at DESC`
+      `SELECT id, name, description, created_at, play_count, last_played_at FROM ${tableName} ORDER BY created_at DESC`,
     );
     res.json(rows);
   } catch (err) {
-    console.error('Error fetching games:', err);
-    res.status(500).json({ error: 'Failed to fetch games' });
+    console.error("Error fetching games:", err);
+    res.status(500).json({ error: "Failed to fetch games" });
   }
 });
 
 // API endpoint to get game statistics (active players, play counts)
-app.get('/api/game-stats', async (req, res) => {
+app.get("/api/game-stats", async (req, res) => {
   try {
     const stats: Record<string, GameStats> = {};
-    
+
     // Get stats for database games
     const tableName = getGamesTableName();
     const { rows } = await query<Game>(
-      `SELECT name, play_count, last_played_at FROM ${tableName}`
+      `SELECT name, play_count, last_played_at FROM ${tableName}`,
     );
-    rows.forEach(game => {
+    rows.forEach((game) => {
       const liveStats = getGameStats(game.name);
       const gameStat: GameStats = {
         gameName: game.name,
         activePlayers: liveStats.activePlayers,
         activeRooms: liveStats.activeRooms,
-        totalPlayCount: game.play_count || 0
+        totalPlayCount: game.play_count || 0,
       };
       // Only add lastPlayedAt if it exists (exactOptionalPropertyTypes)
       if (game.last_played_at) {
@@ -1884,46 +2052,50 @@ app.get('/api/game-stats', async (req, res) => {
       }
       stats[game.name] = gameStat;
     });
-    
+
     // Add stats for premade games
-    Object.keys(PREMADE_GAMES).forEach(gameName => {
+    Object.keys(PREMADE_GAMES).forEach((gameName) => {
       const liveStats = getGameStats(gameName);
       stats[gameName] = {
         gameName,
         activePlayers: liveStats.activePlayers,
         activeRooms: liveStats.activeRooms,
-        totalPlayCount: 0 // Premade games don't track play count in DB
+        totalPlayCount: 0, // Premade games don't track play count in DB
         // lastPlayedAt not included for premade games
       };
     });
-    
+
     res.json(stats);
   } catch (err) {
-    console.error('Error fetching game stats:', err);
-    res.status(500).json({ error: 'Failed to fetch game stats' });
+    console.error("Error fetching game stats:", err);
+    res.status(500).json({ error: "Failed to fetch game stats" });
   }
 });
 
 // Matchmaking endpoints
-app.post('/api/matchmaking/join', async (req, res) => {
+app.post("/api/matchmaking/join", async (req, res) => {
   try {
     const { gameName, playerId } = req.body;
-    
+
     if (!gameName || !playerId) {
-      return res.status(400).json({ error: 'gameName and playerId are required' });
+      return res
+        .status(400)
+        .json({ error: "gameName and playerId are required" });
     }
-    
+
     // Check if player is already in queue
-    const existingIndex = matchmakingQueue.findIndex(p => p.playerId === playerId);
+    const existingIndex = matchmakingQueue.findIndex(
+      (p) => p.playerId === playerId,
+    );
     if (existingIndex !== -1) {
-      return res.json({ message: 'Already in queue' });
+      return res.json({ message: "Already in queue" });
     }
 
     // Check if player already has a match result (prevent joining while already matched)
     const existingResult = matchmakingResults.get(playerId);
-    if (existingResult && existingResult.status === 'matched') {
+    if (existingResult && existingResult.status === "matched") {
       // Player is already matched, don't add them to queue again
-      return res.json({ message: 'Already matched' });
+      return res.json({ message: "Already matched" });
     }
 
     // Try to join an existing live room for games that allow late joining
@@ -1945,74 +2117,78 @@ app.post('/api/matchmaking/join', async (req, res) => {
 
       if (targetRoomId) {
         matchmakingResults.set(playerId, {
-          status: 'matched',
-          roomId: targetRoomId
+          status: "matched",
+          roomId: targetRoomId,
         });
 
         console.log(
-          `Player ${playerId} joined live room ${targetRoomId} for game ${decodedGameName} via matchmaking`
+          `Player ${playerId} joined live room ${targetRoomId} for game ${decodedGameName} via matchmaking`,
         );
 
-        return res.json({ message: 'Joined live game' });
+        return res.json({ message: "Joined live game" });
       }
     } catch (liveErr) {
-      console.error('Error trying to join live room for matchmaking:', liveErr);
+      console.error("Error trying to join live room for matchmaking:", liveErr);
     }
 
     // Add player to queue
     matchmakingQueue.push({
       playerId,
       gameName: decodedGameName,
-      timestamp: Date.now()
+      timestamp: Date.now(),
     });
-    
-    console.log(`Player ${playerId} joined matchmaking for ${gameName}. Queue size: ${matchmakingQueue.length}`);
-    
+
+    console.log(
+      `Player ${playerId} joined matchmaking for ${gameName}. Queue size: ${matchmakingQueue.length}`,
+    );
+
     // Set initial status
-    matchmakingResults.set(playerId, { status: 'waiting' });
-    
+    matchmakingResults.set(playerId, { status: "waiting" });
+
     // Try to match immediately
     await tryMatchPlayers();
-    
-    res.json({ message: 'Joined matchmaking queue' });
+
+    res.json({ message: "Joined matchmaking queue" });
   } catch (err) {
-    console.error('Error joining matchmaking:', err);
-    res.status(500).json({ error: 'Failed to join matchmaking' });
+    console.error("Error joining matchmaking:", err);
+    res.status(500).json({ error: "Failed to join matchmaking" });
   }
 });
 
-app.post('/api/matchmaking/leave', (req, res) => {
+app.post("/api/matchmaking/leave", (req, res) => {
   try {
     const { playerId } = req.body;
 
     if (!playerId) {
-      return res.status(400).json({ error: 'playerId is required' });
+      return res.status(400).json({ error: "playerId is required" });
     }
 
     // Remove player from queue
-    const index = matchmakingQueue.findIndex(p => p.playerId === playerId);
+    const index = matchmakingQueue.findIndex((p) => p.playerId === playerId);
     if (index !== -1) {
       matchmakingQueue.splice(index, 1);
-      console.log(`Player ${playerId} left matchmaking. Queue size: ${matchmakingQueue.length}`);
+      console.log(
+        `Player ${playerId} left matchmaking. Queue size: ${matchmakingQueue.length}`,
+      );
     }
 
     // Remove result
     matchmakingResults.delete(playerId);
 
-    res.json({ message: 'Left matchmaking queue' });
+    res.json({ message: "Left matchmaking queue" });
   } catch (err) {
-    console.error('Error leaving matchmaking:', err);
-    res.status(500).json({ error: 'Failed to leave matchmaking' });
+    console.error("Error leaving matchmaking:", err);
+    res.status(500).json({ error: "Failed to leave matchmaking" });
   }
 });
 
 // Get matchmaking stats for a specific game
-app.get('/api/matchmaking/stats/:gameName', (req, res) => {
+app.get("/api/matchmaking/stats/:gameName", (req, res) => {
   try {
     const { gameName } = req.params;
 
     if (!gameName) {
-      return res.status(400).json({ error: 'gameName is required' });
+      return res.status(400).json({ error: "gameName is required" });
     }
 
     // Decode the game name (Express automatically decodes route params, but just to be sure)
@@ -2020,42 +2196,52 @@ app.get('/api/matchmaking/stats/:gameName', (req, res) => {
 
     // Count players in queue for this game - need to compare both encoded and decoded versions
     // because the queue might store either depending on how the client sent it
-    const playersInQueue = matchmakingQueue.filter(p => {
+    const playersInQueue = matchmakingQueue.filter((p) => {
       const queueGameName = p.gameName;
       // Try to decode the queue game name to compare
-      const decodedQueueGameName = queueGameName.includes('%') ? decodeURIComponent(queueGameName) : queueGameName;
-      return decodedQueueGameName === decodedGameName || queueGameName === decodedGameName;
+      const decodedQueueGameName = queueGameName.includes("%")
+        ? decodeURIComponent(queueGameName)
+        : queueGameName;
+      return (
+        decodedQueueGameName === decodedGameName ||
+        queueGameName === decodedGameName
+      );
     }).length;
 
-    console.log(`[Matchmaking Stats] Requested game: "${gameName}" (decoded: "${decodedGameName}")`);
+    console.log(
+      `[Matchmaking Stats] Requested game: "${gameName}" (decoded: "${decodedGameName}")`,
+    );
     console.log(`[Matchmaking Stats] Players in queue: ${playersInQueue}`);
-    console.log(`[Matchmaking Stats] Full queue:`, matchmakingQueue.map(p => ({ game: p.gameName, player: p.playerId })));
+    console.log(
+      `[Matchmaking Stats] Full queue:`,
+      matchmakingQueue.map((p) => ({ game: p.gameName, player: p.playerId })),
+    );
 
     res.json({
       gameName: decodedGameName,
       playersInQueue,
-      timestamp: Date.now()
+      timestamp: Date.now(),
     });
   } catch (err) {
-    console.error('Error getting matchmaking stats:', err);
-    res.status(500).json({ error: 'Failed to get matchmaking stats' });
+    console.error("Error getting matchmaking stats:", err);
+    res.status(500).json({ error: "Failed to get matchmaking stats" });
   }
 });
 
-app.get('/api/matchmaking/status/:playerId', (req, res) => {
+app.get("/api/matchmaking/status/:playerId", (req, res) => {
   try {
     const { playerId } = req.params;
-    
+
     const result = matchmakingResults.get(playerId);
-    
+
     if (!result) {
-      return res.json({ status: 'not_in_queue' });
+      return res.json({ status: "not_in_queue" });
     }
-    
+
     res.json(result);
   } catch (err) {
-    console.error('Error checking matchmaking status:', err);
-    res.status(500).json({ error: 'Failed to check status' });
+    console.error("Error checking matchmaking status:", err);
+    res.status(500).json({ error: "Failed to check status" });
   }
 });
 
@@ -2073,93 +2259,133 @@ io.on("connection", (socket) => {
       console.error(`Socket connect error for ${socket.id}:`, error);
     });
 
-  socket.on("join_room", async ({ gameName, roomName, persistentPlayerId, matchmakingPlayerId, username }: { gameName: string, roomName: string, persistentPlayerId?: string, matchmakingPlayerId?: string, username?: string }) => {
-    try {
-      // Sanitize roomName - strip any query parameters that might have been incorrectly included
-      // This handles cases where old client code sent malformed URLs
-      const sanitizedRoomName = (roomName?.split('?')[0] || roomName)?.split('&')[0] || roomName;
+    socket.on(
+      "join_room",
+      async ({
+        gameName,
+        roomName,
+        persistentPlayerId,
+        matchmakingPlayerId,
+        username,
+      }: {
+        gameName: string;
+        roomName: string;
+        persistentPlayerId?: string;
+        matchmakingPlayerId?: string;
+        username?: string;
+      }) => {
+        try {
+          // Sanitize roomName - strip any query parameters that might have been incorrectly included
+          // This handles cases where old client code sent malformed URLs
+          const sanitizedRoomName =
+            (roomName?.split("?")[0] || roomName)?.split("&")[0] || roomName;
 
-      const roomId = `${gameName}/${sanitizedRoomName}`;
-      console.log(`User ${socket.id} attempting to join room: ${roomId}`, persistentPlayerId ? `with persistent ID: ${persistentPlayerId}` : '', matchmakingPlayerId ? `with matchmaking ID: ${matchmakingPlayerId}` : '');
-
-      // Check if this is a matchmaking room
-      const matchmakingRoom = matchmakingRooms.get(sanitizedRoomName);
-      if (matchmakingRoom) {
-        // Verify the player is expected in this matchmaking room using matchmakingPlayerId
-        if (!matchmakingPlayerId || !matchmakingRoom.expectedPlayers.has(matchmakingPlayerId)) {
-          console.log(`Player ${socket.id} (matchmakingId: ${matchmakingPlayerId}) attempted to join matchmaking room ${sanitizedRoomName} but was not matched for it`);
-          socket.emit("error", "You are not authorized to join this matchmaking room");
-          return;
-        }
-        // Track that this player has connected
-        matchmakingRoom.connectedPlayers.add(socket.id);
-        console.log(`Matchmaking room ${sanitizedRoomName}: ${matchmakingRoom.connectedPlayers.size}/${matchmakingRoom.expectedPlayers.size} players connected`);
-
-        // Remove player from matchmaking queue (in case they're still there)
-        const queueIndex = matchmakingQueue.findIndex(p => p.playerId === matchmakingPlayerId);
-        if (queueIndex !== -1) {
-          matchmakingQueue.splice(queueIndex, 1);
-          console.log(`Removed player ${matchmakingPlayerId} from matchmaking queue on connection`);
-        }
-
-        // Clear the matchmaking result for this player so they can join matchmaking again later
-        matchmakingResults.delete(matchmakingPlayerId);
-        console.log(`Cleared matchmaking result for player ${matchmakingPlayerId}`);
-      }
-
-      // Leave previous rooms
-      socket.rooms.forEach((room) => {
-        if (room !== socket.id) {
-          socket.leave(room);
-          console.log(`User ${socket.id} left room: ${room}`);
-        }
-      });
-
-    // Join or Create Room
-    let room = rooms.get(roomId);
-
-    if (!room) {
-      console.log(`Creating new room ${roomId} for game ${gameName}`);
-      try {
-        let game: Game | null = null;
-        
-        // Check if it's a premade game
-        if (PREMADE_GAMES[gameName as keyof typeof PREMADE_GAMES]) {
-          const premade = PREMADE_GAMES[gameName as keyof typeof PREMADE_GAMES];
-          game = {
-            id: premade.name,
-            name: premade.name,
-            description: premade.description,
-            code: premade.code,
-            created_at: new Date()
-          };
-        } else {
-          // Fetch from database
-          const tableName = getGamesTableName();
-          const { rows } = await query<Game>(
-            `SELECT * FROM ${tableName} WHERE name = $1`,
-            gameName
+          const roomId = `${gameName}/${sanitizedRoomName}`;
+          console.log(
+            `User ${socket.id} attempting to join room: ${roomId}`,
+            persistentPlayerId
+              ? `with persistent ID: ${persistentPlayerId}`
+              : "",
+            matchmakingPlayerId
+              ? `with matchmaking ID: ${matchmakingPlayerId}`
+              : "",
           );
-          if (rows.length === 0) {
-            console.error(`Game not found: ${gameName}`);
-            socket.emit("error", "Game not found");
-            return;
+
+          // Check if this is a matchmaking room
+          const matchmakingRoom = matchmakingRooms.get(sanitizedRoomName);
+          if (matchmakingRoom) {
+            // Verify the player is expected in this matchmaking room using matchmakingPlayerId
+            if (
+              !matchmakingPlayerId ||
+              !matchmakingRoom.expectedPlayers.has(matchmakingPlayerId)
+            ) {
+              console.log(
+                `Player ${socket.id} (matchmakingId: ${matchmakingPlayerId}) attempted to join matchmaking room ${sanitizedRoomName} but was not matched for it`,
+              );
+              socket.emit(
+                "error",
+                "You are not authorized to join this matchmaking room",
+              );
+              return;
+            }
+            // Track that this player has connected
+            matchmakingRoom.connectedPlayers.add(socket.id);
+            console.log(
+              `Matchmaking room ${sanitizedRoomName}: ${matchmakingRoom.connectedPlayers.size}/${matchmakingRoom.expectedPlayers.size} players connected`,
+            );
+
+            // Remove player from matchmaking queue (in case they're still there)
+            const queueIndex = matchmakingQueue.findIndex(
+              (p) => p.playerId === matchmakingPlayerId,
+            );
+            if (queueIndex !== -1) {
+              matchmakingQueue.splice(queueIndex, 1);
+              console.log(
+                `Removed player ${matchmakingPlayerId} from matchmaking queue on connection`,
+              );
+            }
+
+            // Clear the matchmaking result for this player so they can join matchmaking again later
+            matchmakingResults.delete(matchmakingPlayerId);
+            console.log(
+              `Cleared matchmaking result for player ${matchmakingPlayerId}`,
+            );
           }
-          // rows[0] could be undefined, convert to null if needed
-          game = rows[0] ?? null;
-        }
 
-        // At this point, game should never be null (we return early if not found)
-        // But TypeScript doesn't track the early return, so we add a safety check
-        if (!game) {
-          console.error(`Game not found: ${gameName}`);
-          socket.emit("error", "Game not found");
-          return;
-        }
+          // Leave previous rooms
+          socket.rooms.forEach((room) => {
+            if (room !== socket.id) {
+              socket.leave(room);
+              console.log(`User ${socket.id} left room: ${room}`);
+            }
+          });
 
-        // Execute game logic to get server-side state machine
-        // We need to wrap the code to export serverLogic to the sandbox
-        const wrappedCode = `
+          // Join or Create Room
+          let room = rooms.get(roomId);
+
+          if (!room) {
+            console.log(`Creating new room ${roomId} for game ${gameName}`);
+            try {
+              let game: Game | null = null;
+
+              // Check if it's a premade game
+              if (PREMADE_GAMES[gameName as keyof typeof PREMADE_GAMES]) {
+                const premade =
+                  PREMADE_GAMES[gameName as keyof typeof PREMADE_GAMES];
+                game = {
+                  id: premade.name,
+                  name: premade.name,
+                  description: premade.description,
+                  code: premade.code,
+                  created_at: new Date(),
+                };
+              } else {
+                // Fetch from database
+                const tableName = getGamesTableName();
+                const { rows } = await query<Game>(
+                  `SELECT * FROM ${tableName} WHERE name = $1`,
+                  gameName,
+                );
+                if (rows.length === 0) {
+                  console.error(`Game not found: ${gameName}`);
+                  socket.emit("error", "Game not found");
+                  return;
+                }
+                // rows[0] could be undefined, convert to null if needed
+                game = rows[0] ?? null;
+              }
+
+              // At this point, game should never be null (we return early if not found)
+              // But TypeScript doesn't track the early return, so we add a safety check
+              if (!game) {
+                console.error(`Game not found: ${gameName}`);
+                socket.emit("error", "Game not found");
+                return;
+              }
+
+              // Execute game logic to get server-side state machine
+              // We need to wrap the code to export serverLogic to the sandbox
+              const wrappedCode = `
           ${game.code}
           
           // Export serverLogic if it exists
@@ -2167,261 +2393,331 @@ io.on("connection", (socket) => {
             exportedServerLogic = serverLogic;
           }
         `;
-        
-        const sandbox = { 
-          console: console,
-          exportedServerLogic: undefined as any,
-          // Provide DOM-like stubs for code that might reference them
-          document: undefined,
-          window: undefined,
-          // Provide chess.js for game logic
-          Chess: Chess,
-          require: (moduleName: string) => {
-            if (moduleName === 'chess.js') {
-              return { Chess };
+
+              const sandbox = {
+                console: console,
+                exportedServerLogic: undefined as any,
+                // Provide DOM-like stubs for code that might reference them
+                document: undefined,
+                window: undefined,
+                // Provide chess.js for game logic
+                Chess: Chess,
+                require: (moduleName: string) => {
+                  if (moduleName === "chess.js") {
+                    return { Chess };
+                  }
+                  throw new Error(
+                    `Module ${moduleName} is not available in game sandbox`,
+                  );
+                },
+              };
+              const context = vm.createContext(sandbox);
+
+              try {
+                const script = new vm.Script(wrappedCode);
+                script.runInContext(context);
+
+                const logic = sandbox.exportedServerLogic;
+
+                if (!logic) {
+                  throw new Error("Game code must define serverLogic");
+                }
+
+                if (!logic.initialState) {
+                  throw new Error("serverLogic must have initialState");
+                }
+
+                if (!logic.moves || typeof logic.moves !== "object") {
+                  throw new Error("serverLogic must have moves object");
+                }
+
+                console.log(`Game logic loaded for ${gameName}:`, {
+                  hasInitialState: !!logic.initialState,
+                  moveCount: Object.keys(logic.moves).length,
+                  moves: Object.keys(logic.moves),
+                });
+
+                const rawGame: any = game;
+                const minPlayersPerRoom =
+                  typeof rawGame.min_players_per_room === "number" &&
+                  Number.isFinite(rawGame.min_players_per_room)
+                    ? Math.max(1, Math.floor(rawGame.min_players_per_room))
+                    : 2;
+                const maxPlayersPerRoom =
+                  typeof rawGame.max_players_per_room === "number" &&
+                  Number.isFinite(rawGame.max_players_per_room)
+                    ? Math.max(
+                        minPlayersPerRoom,
+                        Math.floor(rawGame.max_players_per_room),
+                      )
+                    : 2;
+                const hasWinCondition =
+                  typeof rawGame.has_win_condition === "boolean"
+                    ? rawGame.has_win_condition
+                    : true;
+                const canJoinLate =
+                  typeof rawGame.can_join_late === "boolean"
+                    ? rawGame.can_join_late
+                    : false;
+
+                room = {
+                  id: roomId,
+                  gameId: game.id,
+                  gameName: game.name,
+                  state: JSON.parse(JSON.stringify(logic.initialState)),
+                  players: new Map(),
+                  persistentPlayerMap: new Map(),
+                  logic: logic,
+                  minPlayersPerRoom,
+                  maxPlayersPerRoom,
+                  hasWinCondition,
+                  canJoinLate,
+                };
+                rooms.set(roomId, room);
+                console.log(`Room ${roomId} created successfully`);
+
+                // Increment play count for this game
+                await incrementPlayCount(gameName);
+
+                // Start game loop if the game has a tick action
+                startGameLoop(room);
+              } catch (e: any) {
+                console.error("Error executing game code:", e);
+                socket.emit("error", `Invalid game code: ${e.message}`);
+                return;
+              }
+            } catch (err) {
+              console.error("DB Error:", err);
+              socket.emit("error", "Server error fetching game");
+              return;
             }
-            throw new Error(`Module ${moduleName} is not available in game sandbox`);
-          }
-        };
-        const context = vm.createContext(sandbox);
-        
-        try {
-          const script = new vm.Script(wrappedCode);
-          script.runInContext(context);
-          
-          const logic = sandbox.exportedServerLogic;
-          
-          if (!logic) {
-            throw new Error("Game code must define serverLogic");
-          }
-          
-          if (!logic.initialState) {
-            throw new Error("serverLogic must have initialState");
-          }
-          
-          if (!logic.moves || typeof logic.moves !== 'object') {
-            throw new Error("serverLogic must have moves object");
+          } else {
+            console.log(`User ${socket.id} joining existing room: ${roomId}`);
           }
 
-          console.log(`Game logic loaded for ${gameName}:`, {
-            hasInitialState: !!logic.initialState,
-            moveCount: Object.keys(logic.moves).length,
-            moves: Object.keys(logic.moves)
+          let isReconnection = false;
+          let oldSocketId: string | undefined;
+
+          // Handle persistent player ID for reconnections
+          if (persistentPlayerId) {
+            // Check if this persistent player was already in the room
+            oldSocketId = room.persistentPlayerMap.get(persistentPlayerId);
+
+            if (oldSocketId && oldSocketId !== socket.id) {
+              console.log(
+                `Reconnection detected: persistent player ${persistentPlayerId} had socket ${oldSocketId}, now ${socket.id}`,
+              );
+              isReconnection = true;
+
+              // Update the player's socket ID in state (for games that track by socket ID)
+              if (
+                room.state.playerColors &&
+                room.state.playerColors[oldSocketId]
+              ) {
+                const color = room.state.playerColors[oldSocketId];
+                delete room.state.playerColors[oldSocketId];
+                room.state.playerColors[socket.id] = color;
+                console.log(
+                  `Restored player color: ${color} for socket ${socket.id}`,
+                );
+              }
+
+              // Remove old player entry
+              room.players.delete(oldSocketId);
+            }
+
+            // Update persistent player mapping
+            room.persistentPlayerMap.set(persistentPlayerId, socket.id);
+          }
+
+          // Prevent new players from joining a full room (but always allow reconnections)
+          if (!room) {
+            console.error(`Room ${roomId} not found after creation attempt`);
+            socket.emit("error", "Room not available");
+            return;
+          }
+
+          if (!isReconnection && room.players.size >= room.maxPlayersPerRoom) {
+            console.log(
+              `Room ${roomId} is full (${room.players.size}/${room.maxPlayersPerRoom}), rejecting join for ${socket.id}`,
+            );
+            socket.emit(
+              "error",
+              "Room is full. Please try matchmaking instead.",
+            );
+            return;
+          }
+
+          // Join logic
+          socket.join(roomId);
+
+          // Add player to room
+          room.players.set(socket.id, {
+            id: socket.id,
+            persistentId: persistentPlayerId,
+            username: username || "Guest",
+            joinedAt: Date.now(),
           });
 
-          const rawGame: any = game;
-          const minPlayersPerRoom =
-            typeof rawGame.min_players_per_room === 'number' && Number.isFinite(rawGame.min_players_per_room)
-              ? Math.max(1, Math.floor(rawGame.min_players_per_room))
-              : 2;
-          const maxPlayersPerRoom =
-            typeof rawGame.max_players_per_room === 'number' && Number.isFinite(rawGame.max_players_per_room)
-              ? Math.max(minPlayersPerRoom, Math.floor(rawGame.max_players_per_room))
-              : 2;
-          const hasWinCondition =
-            typeof rawGame.has_win_condition === 'boolean' ? rawGame.has_win_condition : true;
-          const canJoinLate =
-            typeof rawGame.can_join_late === 'boolean' ? rawGame.can_join_late : false;
-
-          room = {
-            id: roomId,
-            gameId: game.id,
-            gameName: game.name,
-            state: JSON.parse(JSON.stringify(logic.initialState)),
-            players: new Map(),
-            persistentPlayerMap: new Map(),
-            logic: logic,
-            minPlayersPerRoom,
-            maxPlayersPerRoom,
-            hasWinCondition,
-            canJoinLate
-          };
-          rooms.set(roomId, room);
-          console.log(`Room ${roomId} created successfully`);
-
-          // Increment play count for this game
-          await incrementPlayCount(gameName);
-
-          // Start game loop if the game has a tick action
-          startGameLoop(room);
-        } catch (e: any) {
-          console.error("Error executing game code:", e);
-          socket.emit("error", `Invalid game code: ${e.message}`);
-          return;
-        }
-      } catch (err) {
-        console.error("DB Error:", err);
-        socket.emit("error", "Server error fetching game");
-        return;
-      }
-    } else {
-      console.log(`User ${socket.id} joining existing room: ${roomId}`);
-    }
-
-    let isReconnection = false;
-    let oldSocketId: string | undefined;
-    
-    // Handle persistent player ID for reconnections
-    if (persistentPlayerId) {
-      // Check if this persistent player was already in the room
-      oldSocketId = room.persistentPlayerMap.get(persistentPlayerId);
-      
-      if (oldSocketId && oldSocketId !== socket.id) {
-        console.log(`Reconnection detected: persistent player ${persistentPlayerId} had socket ${oldSocketId}, now ${socket.id}`);
-        isReconnection = true;
-        
-        // Update the player's socket ID in state (for games that track by socket ID)
-        if (room.state.playerColors && room.state.playerColors[oldSocketId]) {
-          const color = room.state.playerColors[oldSocketId];
-          delete room.state.playerColors[oldSocketId];
-          room.state.playerColors[socket.id] = color;
-          console.log(`Restored player color: ${color} for socket ${socket.id}`);
-        }
-        
-        // Remove old player entry
-        room.players.delete(oldSocketId);
-      }
-      
-      // Update persistent player mapping
-      room.persistentPlayerMap.set(persistentPlayerId, socket.id);
-    }
-    
-    // Prevent new players from joining a full room (but always allow reconnections)
-    if (!room) {
-      console.error(`Room ${roomId} not found after creation attempt`);
-      socket.emit("error", "Room not available");
-      return;
-    }
-
-    if (!isReconnection && room.players.size >= room.maxPlayersPerRoom) {
-      console.log(
-        `Room ${roomId} is full (${room.players.size}/${room.maxPlayersPerRoom}), rejecting join for ${socket.id}`
-      );
-      socket.emit("error", "Room is full. Please try matchmaking instead.");
-      return;
-    }
-
-    // Join logic
-    socket.join(roomId);
-    
-    // Add player to room
-    room.players.set(socket.id, {
-      id: socket.id,
-      persistentId: persistentPlayerId,
-      username: username || 'Guest',
-      joinedAt: Date.now()
-    });
-    
-    // Only trigger playerJoined for new players, not reconnections
-    if (!isReconnection && room.logic.moves.playerJoined) {
-      try {
-        room.logic.moves.playerJoined(room.state, {}, socket.id);
-      } catch (e) {
-        console.error('Error in playerJoined:', e);
-      }
-    }
-    
-    console.log(`User ${socket.id} ${isReconnection ? 'reconnected to' : 'joined'} ${roomId}. Total players: ${room.players.size}`);
-    console.log('Player colors:', room.state.playerColors);
-
-      // Send state to all players in room (filter out _ prefixed fields)
-      io.to(roomId).emit("state_update", enrichStateWithPlayerMetadata(room.state, room));
-      io.to(roomId).emit("player_joined", { playerId: socket.id, count: room.players.size });
-    } catch (error) {
-      console.error(`Error in join_room for ${socket.id}:`, error);
-      socket.emit("error", "Failed to join room. Please try again.");
-    }
-  });
-
-  socket.on("game_action", async ({ roomId, action, payload }: { roomId: string, action: string, payload: any }) => {
-    try {
-      const room = rooms.get(roomId);
-      if (!room) {
-        console.warn(`Action ${action} for non-existent room: ${roomId}`);
-        return;
-      }
-
-      if (room.logic.moves[action]) {
-        try {
-          console.log(`Executing action ${action} in room ${roomId} by player ${socket.id}`);
-          room.logic.moves[action](room.state, payload, socket.id);
-
-          // Check if game ended and handle ELO updates
-          if (room.state.gameEnded) {
-            await handleGameEnd(room);
-          }
-
-          io.to(roomId).emit("state_update", enrichStateWithPlayerMetadata(room.state, room));
-        } catch (e: any) {
-          console.error("Game Logic Error:", e);
-          socket.emit("error", `Game logic execution failed: ${e.message}`);
-        }
-      } else {
-        console.warn(`Unknown action: ${action}. Available: ${Object.keys(room.logic.moves).join(', ')}`);
-      }
-    } catch (error) {
-      console.error(`Error in game_action for ${socket.id}:`, error);
-      socket.emit("error", "Failed to execute action. Please try again.");
-    }
-  });
-
-  // Handle chat messages
-  socket.on("chat_message", ({ roomId, message, username }: { roomId: string, message: string, username: string }) => {
-    try {
-      if (!roomId || !message || !message.trim()) {
-        return;
-      }
-
-      // Sanitize message
-      const sanitizedMessage = message.trim().substring(0, 200);
-      const senderUsername = username || 'Guest';
-
-      console.log(`Chat message in room ${roomId} from ${senderUsername}: ${sanitizedMessage}`);
-
-      // Broadcast to all players in the room
-      io.to(roomId).emit("chat_message", {
-        sender: senderUsername,
-        message: sanitizedMessage,
-        timestamp: Date.now()
-      });
-    } catch (err) {
-      console.error("Error handling chat message:", err);
-    }
-  });
-
-  socket.on("disconnect", () => {
-    try {
-      console.log("User disconnected:", socket.id);
-
-      // Remove player from all rooms
-      rooms.forEach((room, roomId) => {
-        if (room.players.has(socket.id)) {
-          room.players.delete(socket.id);
-
-          // Call game-specific playerLeft handler if it exists
-          if (room.logic.moves.playerLeft) {
+          // Only trigger playerJoined for new players, not reconnections
+          if (!isReconnection && room.logic.moves.playerJoined) {
             try {
-              room.logic.moves.playerLeft(room.state, {}, socket.id);
-              io.to(roomId).emit("state_update", enrichStateWithPlayerMetadata(room.state, room));
+              room.logic.moves.playerJoined(room.state, {}, socket.id);
             } catch (e) {
-              console.error(`Error in playerLeft handler for room ${roomId}:`, e);
+              console.error("Error in playerJoined:", e);
             }
           }
 
-          io.to(roomId).emit("player_joined", { playerId: socket.id, count: room.players.size });
+          console.log(
+            `User ${socket.id} ${isReconnection ? "reconnected to" : "joined"} ${roomId}. Total players: ${room.players.size}`,
+          );
+          console.log("Player colors:", room.state.playerColors);
 
-          // Clean up empty rooms
-          if (room.players.size === 0) {
-            stopGameLoop(room);
-            rooms.delete(roomId);
-            console.log(`Cleaned up empty room: ${roomId}`);
-          }
+          // Send state to all players in room (filter out _ prefixed fields)
+          io.to(roomId).emit(
+            "state_update",
+            enrichStateWithPlayerMetadata(room.state, room),
+          );
+          io.to(roomId).emit("player_joined", {
+            playerId: socket.id,
+            count: room.players.size,
+          });
+        } catch (error) {
+          console.error(`Error in join_room for ${socket.id}:`, error);
+          socket.emit("error", "Failed to join room. Please try again.");
         }
-      });
-    } catch (error) {
-      console.error(`Error in disconnect handler for ${socket.id}:`, error);
-    }
-  });
+      },
+    );
+
+    socket.on(
+      "game_action",
+      async ({
+        roomId,
+        action,
+        payload,
+      }: {
+        roomId: string;
+        action: string;
+        payload: any;
+      }) => {
+        try {
+          const room = rooms.get(roomId);
+          if (!room) {
+            console.warn(`Action ${action} for non-existent room: ${roomId}`);
+            return;
+          }
+
+          if (room.logic.moves[action]) {
+            try {
+              console.log(
+                `Executing action ${action} in room ${roomId} by player ${socket.id}`,
+              );
+              room.logic.moves[action](room.state, payload, socket.id);
+
+              // Check if game ended and handle ELO updates
+              if (room.state.gameEnded) {
+                await handleGameEnd(room);
+              }
+
+              io.to(roomId).emit(
+                "state_update",
+                enrichStateWithPlayerMetadata(room.state, room),
+              );
+            } catch (e: any) {
+              console.error("Game Logic Error:", e);
+              socket.emit("error", `Game logic execution failed: ${e.message}`);
+            }
+          } else {
+            console.warn(
+              `Unknown action: ${action}. Available: ${Object.keys(room.logic.moves).join(", ")}`,
+            );
+          }
+        } catch (error) {
+          console.error(`Error in game_action for ${socket.id}:`, error);
+          socket.emit("error", "Failed to execute action. Please try again.");
+        }
+      },
+    );
+
+    // Handle chat messages
+    socket.on(
+      "chat_message",
+      ({
+        roomId,
+        message,
+        username,
+      }: {
+        roomId: string;
+        message: string;
+        username: string;
+      }) => {
+        try {
+          if (!roomId || !message || !message.trim()) {
+            return;
+          }
+
+          // Sanitize message
+          const sanitizedMessage = message.trim().substring(0, 200);
+          const senderUsername = username || "Guest";
+
+          console.log(
+            `Chat message in room ${roomId} from ${senderUsername}: ${sanitizedMessage}`,
+          );
+
+          // Broadcast to all players in the room
+          io.to(roomId).emit("chat_message", {
+            sender: senderUsername,
+            message: sanitizedMessage,
+            timestamp: Date.now(),
+          });
+        } catch (err) {
+          console.error("Error handling chat message:", err);
+        }
+      },
+    );
+
+    socket.on("disconnect", () => {
+      try {
+        console.log("User disconnected:", socket.id);
+
+        // Remove player from all rooms
+        rooms.forEach((room, roomId) => {
+          if (room.players.has(socket.id)) {
+            room.players.delete(socket.id);
+
+            // Call game-specific playerLeft handler if it exists
+            if (room.logic.moves.playerLeft) {
+              try {
+                room.logic.moves.playerLeft(room.state, {}, socket.id);
+                io.to(roomId).emit(
+                  "state_update",
+                  enrichStateWithPlayerMetadata(room.state, room),
+                );
+              } catch (e) {
+                console.error(
+                  `Error in playerLeft handler for room ${roomId}:`,
+                  e,
+                );
+              }
+            }
+
+            io.to(roomId).emit("player_joined", {
+              playerId: socket.id,
+              count: room.players.size,
+            });
+
+            // Clean up empty rooms
+            if (room.players.size === 0) {
+              stopGameLoop(room);
+              rooms.delete(roomId);
+              console.log(`Cleaned up empty room: ${roomId}`);
+            }
+          }
+        });
+      } catch (error) {
+        console.error(`Error in disconnect handler for ${socket.id}:`, error);
+      }
+    });
   } catch (error) {
     console.error(`Error setting up socket handlers for ${socket.id}:`, error);
   }
@@ -2437,7 +2733,7 @@ let isShuttingDown = false;
 
 async function gracefulShutdown(signal: string) {
   if (isShuttingDown) {
-    console.log('Shutdown already in progress...');
+    console.log("Shutdown already in progress...");
     return;
   }
 
@@ -2446,28 +2742,28 @@ async function gracefulShutdown(signal: string) {
 
   try {
     // Stop accepting new connections
-    console.log('Stopping HTTP server...');
+    console.log("Stopping HTTP server...");
     await new Promise<void>((resolve, reject) => {
       httpServer.close((err) => {
         if (err) {
-          console.error('Error closing HTTP server:', err);
+          console.error("Error closing HTTP server:", err);
           reject(err);
         } else {
-          console.log('HTTP server closed');
+          console.log("HTTP server closed");
           resolve();
         }
       });
     });
 
     // Stop all game loops
-    console.log('Stopping all game loops...');
+    console.log("Stopping all game loops...");
     rooms.forEach((room) => {
       stopGameLoop(room);
     });
     console.log(`Stopped ${rooms.size} game loops`);
 
     // Disconnect all sockets gracefully
-    console.log('Disconnecting all sockets...');
+    console.log("Disconnecting all sockets...");
     const sockets = await io.fetchSockets();
     for (const socket of sockets) {
       socket.disconnect(true);
@@ -2475,34 +2771,34 @@ async function gracefulShutdown(signal: string) {
     console.log(`Disconnected ${sockets.length} sockets`);
 
     // Close Socket.io server
-    console.log('Closing Socket.io server...');
+    console.log("Closing Socket.io server...");
     await new Promise<void>((resolve) => {
       io.close(() => {
-        console.log('Socket.io server closed');
+        console.log("Socket.io server closed");
         resolve();
       });
     });
 
-    console.log('Graceful shutdown completed successfully');
+    console.log("Graceful shutdown completed successfully");
     process.exit(0);
   } catch (error) {
-    console.error('Error during graceful shutdown:', error);
+    console.error("Error during graceful shutdown:", error);
     process.exit(1);
   }
 }
 
 // Handle various shutdown signals
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
 // Handle uncaught errors to prevent crashes
-process.on('uncaughtException', (error) => {
-  console.error('Uncaught Exception:', error);
-  gracefulShutdown('uncaughtException');
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught Exception:", error);
+  gracefulShutdown("uncaughtException");
 });
 
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("Unhandled Rejection at:", promise, "reason:", reason);
   // Don't exit on unhandled rejection, just log it
 });
 
