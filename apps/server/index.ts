@@ -1205,7 +1205,7 @@ async function serveGameClient(gameName: string, roomName: string | undefined, r
     const gameUI = document.getElementById('game-ui');
     const gameUIHeader = document.getElementById('game-ui-header');
     const gameUICollapseToggle = document.getElementById('game-ui-collapse-toggle');
-    let gameUICollapsed = false;
+    let gameUICollapsed = true;
 
     // Function to update toggle button visibility
     function updateToggleVisibility() {
@@ -1229,12 +1229,10 @@ async function serveGameClient(gameName: string, roomName: string | undefined, r
       updateToggleVisibility();
     }
 
-    // Start collapsed on mobile
-    if (window.innerWidth <= 768) {
-      gameUICollapsed = true;
-      gameUI.classList.add('collapsed');
-      updateToggleVisibility();
-    }
+    // Start collapsed by default so it doesn't cover the game
+    gameUI.classList.add('collapsed');
+    gameUICollapseToggle.textContent = '▲';
+    updateToggleVisibility();
 
     gameUIToggle.addEventListener('click', toggleGameUI);
     gameUIHeader.addEventListener('click', toggleGameUI);
@@ -1295,7 +1293,7 @@ async function serveGameClient(gameName: string, roomName: string | undefined, r
     const chatHeader = document.getElementById('chat-header');
     const chatToggle = document.getElementById('chat-toggle');
     const chatToggleBtn = document.getElementById('chat-toggle-btn');
-    let chatCollapsed = false;
+    let chatCollapsed = true;
 
     // Function to update chat toggle button visibility
     function updateChatToggleVisibility() {
@@ -1361,6 +1359,16 @@ async function serveGameClient(gameName: string, roomName: string | undefined, r
       }
       updateChatToggleVisibility();
     }
+
+    // Start chat collapsed by default so it doesn't cover the game
+    (function initializeChatCollapsed() {
+      const gameChat = document.getElementById('game-chat');
+      if (gameChat) {
+        gameChat.classList.add('collapsed');
+      }
+      chatToggle.textContent = '▲';
+      updateChatToggleVisibility();
+    })();
 
     chatHeader.addEventListener('click', toggleChat);
     chatToggleBtn.addEventListener('click', toggleChat);
