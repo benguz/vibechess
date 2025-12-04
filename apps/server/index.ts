@@ -818,6 +818,7 @@ async function serveGameClient(
       display: flex;
       align-items: center;
       justify-content: center;
+      max-width: 200px;
       gap: 6px;
       cursor: pointer;
       z-index: 999;
